@@ -53,26 +53,24 @@ static int ini_property(struct ini *ini, char *key, char *value)
 			return -EINVAL;
 		}
 
-		// Add null terminator so that xcb_xrm_resource_get_string knows where to stop.
-		int buffer_size = strlen(value);
+		// Split "xresource:<name> [default]" at the first space. The null
+		// terminator tells xcb_xrm_resource_get_string where the name ends.
 		char *default_value = strchr(value, ' ');
-		if (default_value) {
-			if (*(default_value + 1) != '\0') {
-				default_value++;
-				default_value[-1] = '\0';
-			}
-		}
+		if (default_value)
+			*default_value++ = '\0';
 
 		char *resource;
 		if (xcb_xrm_resource_get_string(ini->database, value + strlen("xresource:"), NULL, &resource) == 0) {
 			int ret = ini->prop_cb(key, resource, ini->data);
 			free(resource);
 			return ret;
-		} else if (strlen(default_value) > 0) {
+		} else if (default_value && *default_value != '\0') {
 			value = default_value;
 		} else {
-			fatal("invalid Xresource key: \"%s\"", value);
-			return -EINVAL;
+			// Leave the property unset rather than failing the whole bar.
+			error("Xresource \"%s\" is not defined and has no default, ignoring %s",
+			      value + strlen("xresource:"), key);
+			return 0;
 		}
 	}
 
