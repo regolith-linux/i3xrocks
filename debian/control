@@ -5,7 +5,9 @@ Maintainer: Ken Gilmer <kgilmer@gmail.com>
 Build-Depends: 
   debhelper (>= 11), 
   libxcb1-dev, 
-  libxcb-xrm-dev
+  libxcb-xrm-dev,
+  x11-xserver-utils <!nocheck>,
+  xvfb <!nocheck>
 Standards-Version: 4.1.3
 Homepage: https://github.com/regolith-linux/i3xrocks
 
