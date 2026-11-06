@@ -28,6 +28,17 @@ Specifies a conf.d style configuration directory.
 
 *-u* _USERCONFIGDIR_::
 Specifies a conf.d style user configuration directory.
+When given together with *-d*, both directories are read, in the byte order
+of the file names across both, and global properties carry over from one
+file to the next.
+A user file replaces the *-d* file of the same name, which is not read; an
+empty user file hides it.
+A user section with the same name and _instance_ as a block from the *-d*
+directory overrides only the properties it sets, and the block moves to the
+user section's position.
+Each command runs in the directory of the file that set it.
+A missing or empty directory is skipped; the configuration fails only when
+neither directory can be read.
 
 *-v*::
 Increase log level.
@@ -55,6 +66,13 @@ By default, {progname} looks for a configuration file in the following order (no
 . _/etc/i3xrocks.conf_
 
 For the content of the configuration file, please refer to the i3blocks website: https://vivien.github.io/i3blocks
+
+== SIGNALS
+
+*SIGHUP*::
+Read the configuration again and replace the blocks with the result.
+The commands of the previous blocks are terminated first.
+If the configuration cannot be loaded, the bar shows the error instead.
 
 == SEE ALSO
 

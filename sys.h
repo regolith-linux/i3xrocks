@@ -31,6 +31,7 @@ int sys_setitimer(unsigned long interval);
 int sys_waitid(pid_t *pid);
 int sys_waitpid(pid_t pid, int *code);
 int sys_waitanychild(void);
+int sys_kill(pid_t pid, int sig);
 
 int sys_setenv(const char *name, const char *value);
 const char *sys_getenv(const char *name);
@@ -41,6 +42,7 @@ int sys_sigaddset(sigset_t *set, int sig);
 int sys_sigunblock(const sigset_t *set);
 int sys_sigsetmask(const sigset_t *set);
 int sys_sigwaitinfo(sigset_t *set, int *sig, int *fd);
+int sys_sigflush(int sig);
 
 int sys_open(const char *path, int *fd);
 int sys_close(int fd);
