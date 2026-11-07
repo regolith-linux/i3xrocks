@@ -1,3 +1,10 @@
+i3xrocks (1.3.7) bionic; urgency=medium
+
+  [ rego-port-bot ]
+  * fix: do not crash on an undefined xresource without a default
+
+ -- Regolith Linux <regolith.linux@gmail.com>  Sat, 07 Nov 2026 09:13:10 -0800
+
 i3xrocks (1.3.6-2) bionic; urgency=medium
 
   [ Khosrow Moossavi ]
