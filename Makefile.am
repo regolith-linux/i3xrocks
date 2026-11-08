@@ -28,5 +28,5 @@ dist_man1_MANS = \
 dist_sysconf_DATA = \
 	i3xrocks.conf
 
-TESTS = tests/xresource-missing.sh
+TESTS = tests/xresource-missing.sh tests/layered-conf-d.sh
 EXTRA_DIST = $(TESTS)

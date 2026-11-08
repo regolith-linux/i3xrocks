@@ -190,13 +190,11 @@ static int gcd(int a, int b)
 	return a;
 }
 
-static int bar_setup(struct bar *bar)
+static int bar_setup_blocks(struct block *block, unsigned long *sleeptime)
 {
-	struct block *block = bar->blocks;
-	sigset_t *set = &bar->sigset;
-	unsigned long sleeptime = 0;
-	int sig;
 	int err;
+
+	*sleeptime = 0;
 
 	while (block) {
 		err = block_setup(block);
@@ -207,14 +205,28 @@ static int bar_setup(struct bar *bar)
 		 * between all positive block intervals.
 		 */
 		if (block->interval > 0) {
-			if (sleeptime > 0)
-				sleeptime = gcd(sleeptime, block->interval);
+			if (*sleeptime > 0)
+				*sleeptime = gcd(*sleeptime, block->interval);
 			else
-				sleeptime = block->interval;
+				*sleeptime = block->interval;
 		}
 
 		block = block->next;
 	}
+
+	return 0;
+}
+
+static int bar_setup(struct bar *bar)
+{
+	sigset_t *set = &bar->sigset;
+	unsigned long sleeptime;
+	int sig;
+	int err;
+
+	err = bar_setup_blocks(bar->blocks, &sleeptime);
+	if (err)
+		return err;
 
 	err = sys_sigemptyset(set);
 	if (err)
@@ -226,6 +238,11 @@ static int bar_setup(struct bar *bar)
 		return err;
 
 	err = sys_sigaddset(set, SIGINT);
+	if (err)
+		return err;
+
+	/* Configuration reload */
+	err = sys_sigaddset(set, SIGHUP);
 	if (err)
 		return err;
 
@@ -326,7 +343,67 @@ static void bar_teardown(struct bar *bar)
 	debug("bar tear down");
 }
 
-static int bar_poll(struct bar *bar)
+static int bar_load(struct bar *bar);
+
+/* Stop and free the configured blocks; the first block belongs to the bar */
+static void bar_unload(struct bar *bar)
+{
+	struct block *block = bar->blocks->next;
+	struct block *next;
+
+	while (block) {
+		next = block->next;
+		block_stop(block);
+		block_destroy(block);
+		block = next;
+	}
+
+	bar->blocks->next = NULL;
+}
+
+static void bar_reload(struct bar *bar)
+{
+	unsigned long sleeptime;
+	int err;
+
+	debug("reloading configuration");
+
+	bar_unload(bar);
+
+	/* Drop I/O notifications queued for the closed persistent blocks */
+	err = sys_sigflush(SIGRTMIN);
+	if (err)
+		error("failed to discard pending I/O signals");
+
+	/* Clear a previous message, such as a configuration error */
+	err = block_reset(bar->blocks);
+	if (err)
+		error("failed to reset the bar");
+	bar->blocks->tainted = false;
+
+	err = bar_load(bar);
+	if (!err)
+		err = bar_setup_blocks(bar->blocks->next, &sleeptime);
+	if (err) {
+		/* Show the error alone, without the blocks read before it */
+		bar_unload(bar);
+		sleeptime = 0;
+	}
+
+	/* Also disarm the timer when no block has a positive interval */
+	if (sys_setitimer(sleeptime))
+		error("failed to set the timer");
+
+	if (err) {
+		bar_fatal(bar, "Failed to load configuration.");
+		return;
+	}
+
+	bar_print(bar);
+	bar_poll_timed(bar);
+}
+
+static int bar_poll(struct bar *bar, bool failed)
 {
 	int sig, fd;
 	int err;
@@ -334,6 +411,10 @@ static int bar_poll(struct bar *bar)
 	err = bar_setup(bar);
 	if (err)
 		return err;
+
+	/* Report a load error once setup no longer resets the bar's message */
+	if (failed)
+		bar_fatal(bar, "Failed to load configuration.");
 
 	/* Initial display (for static blocks and loading labels) */
 	bar_print(bar);
@@ -352,6 +433,11 @@ static int bar_poll(struct bar *bar)
 
 		if (sig == SIGTERM || sig == SIGINT)
 			break;
+
+		if (sig == SIGHUP) {
+			bar_reload(bar);
+			continue;
+		}
 
 		if (sig == SIGALRM) {
 			bar_poll_expired(bar);
@@ -418,7 +504,7 @@ static struct bar *bar_create(bool term)
 	if (!bar)
 		return NULL;
 
-	bar->blocks = block_create(bar, NULL);
+	bar->blocks = block_create(bar, NULL, NULL);
 	if (!bar->blocks) {
 		bar_destroy(bar);
 		return NULL;
@@ -435,7 +521,7 @@ static struct bar *bar_create(bool term)
 	return bar;
 }
 
-static int bar_config_cb(struct map *map, void *data)
+static int bar_config_cb(struct map *map, const char *dir, void *data)
 {
 	struct bar *bar = data;
 	struct block *block = bar->blocks;
@@ -443,7 +529,7 @@ static int bar_config_cb(struct map *map, void *data)
 	while (block->next)
 		block = block->next;
 
-	block->next = block_create(bar, map);
+	block->next = block_create(bar, map, dir);
 
 	map_destroy(map);
 
@@ -453,28 +539,27 @@ static int bar_config_cb(struct map *map, void *data)
 	return 0;
 }
 
-static void bar_load(struct bar *bar, const char *path, const char *conf_dir, const char *user_conf_dir)
+static int bar_load(struct bar *bar)
 {
+	const char *path = bar->path;
+	const char *conf_dir = bar->conf_dir;
+	const char *user_conf_dir = bar->user_conf_dir;
 	int err;
 
 	if (path) {
 		debug("Loading config from file %s", path);
 		err = config_load(path, bar_config_cb, bar);
 	} else if (conf_dir || user_conf_dir) {
-		if (user_conf_dir) {
-			debug("Loading config from user directory %s", user_conf_dir);
-			err = config_dir_load(user_conf_dir, bar_config_cb, bar, true);
-		}
-
-		// If attempt at user conf failed and have system conf, or only have system conf:
-		if ((err && user_conf_dir && conf_dir) || (conf_dir && !user_conf_dir)) {
-			debug("Loading config from directory %s", conf_dir);
-			err = config_dir_load(conf_dir, bar_config_cb, bar, false);
-		}
+		/* user files take precedence over the package files */
+		debug("Loading config from user directory %s and directory %s",
+		      user_conf_dir ? user_conf_dir : "(none)",
+		      conf_dir ? conf_dir : "(none)");
+		err = config_layers_load(user_conf_dir, conf_dir, bar_config_cb, bar);
+	} else {
+		err = config_load(NULL, bar_config_cb, bar);
 	}
 
-	if (err)
-		bar_fatal(bar, "Failed to load configuration.");
+	return err;
 }
 
 int bar_init(bool term, const char *path, const char *conf_dir, const char *user_conf_dir)
@@ -486,9 +571,13 @@ int bar_init(bool term, const char *path, const char *conf_dir, const char *user
 	if (!bar)
 		return -ENOMEM;
 
-	bar_load(bar, path, conf_dir, user_conf_dir);
+	bar->path = path;
+	bar->conf_dir = conf_dir;
+	bar->user_conf_dir = user_conf_dir;
 
-	err = bar_poll(bar);
+	err = bar_load(bar);
+
+	err = bar_poll(bar, err != 0);
 
 	bar_destroy(bar);
 

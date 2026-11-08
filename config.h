@@ -21,8 +21,8 @@
 
 #include "map.h"
 
-typedef int config_cb_t(struct map *map, void *data);
+typedef int config_cb_t(struct map *map, const char *dir, void *data);
 int config_load(const char *path, config_cb_t *cb, void *data);
-int config_dir_load(const char *path, config_cb_t *cb, void *data, const bool quiet);
+int config_layers_load(const char *user_dir, const char *pkg_dir, config_cb_t *cb, void *data);
 
 #endif /* CONFIG_H */

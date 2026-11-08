@@ -49,6 +49,7 @@ struct block {
 
 	/* Shortcuts */
 	const char *command;
+	char *dir;
 	int interval;
 	int signal;
 	unsigned format;
@@ -63,7 +64,7 @@ struct block {
 	struct block *next;
 };
 
-struct block *block_create(struct bar *bar, const struct map *config);
+struct block *block_create(struct bar *bar, const struct map *config, const char *dir);
 void block_destroy(struct block *block);
 
 int block_reset(struct block *block);
@@ -108,5 +109,6 @@ void block_touch(struct block *block);
 int block_reap(struct block *block);
 int block_update(struct block *block);
 void block_close(struct block *block);
+void block_stop(struct block *block);
 
 #endif /* BLOCK_H */

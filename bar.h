@@ -28,6 +28,11 @@ struct bar {
 	struct block *blocks;
 	sigset_t sigset;
 	bool term;
+
+	/* Configuration sources, read again on SIGHUP */
+	const char *path;
+	const char *conf_dir;
+	const char *user_conf_dir;
 };
 
 #define bar_printf(bar, lvl, fmt, ...) \

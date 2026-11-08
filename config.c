@@ -20,6 +20,11 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <dirent.h>
+#include <errno.h>
+#include <libgen.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "config.h"
 #include "ini.h"
@@ -31,26 +36,72 @@
 #define SYSCONFDIR "/etc"
 #endif
 
+struct pending {
+	struct map *map;	/* section with inherited globals */
+	struct map *own;	/* keys written in the section itself */
+	char *cmd_dir;		/* directory of the file that wrote "command" */
+	bool user;
+	bool dropped;
+	struct pending *next;
+};
+
 struct config {
 	struct map *section;
+	struct map *own;
 	struct map *global;
 	config_cb_t *cb;
 	void *data;
+
+	char dir[PATH_MAX];		/* directory of the file being read */
+	char global_cmd_dir[PATH_MAX];
+	char section_cmd_dir[PATH_MAX];
+
+	/* layered mode: collect sections, resolve, then emit */
+	bool collect;
+	bool user;
+	struct pending *head, *tail;
 };
 
 static int config_finalize(struct config *conf)
 {
 	int err;
 
-	if (conf->section) {
-		if (conf->cb) {
-			err = conf->cb(conf->section, conf->data);
-			if (err)
-				return err;
-		}
+	if (!conf->section)
+		return 0;
 
-		conf->section = NULL;
+	if (conf->collect) {
+		struct pending *p = calloc(1, sizeof(*p));
+		if (!p)
+			return -ENOMEM;
+		p->cmd_dir = strdup(conf->section_cmd_dir);
+		if (!p->cmd_dir) {
+			free(p);
+			return -ENOMEM;
+		}
+		p->map = conf->section;
+		p->own = conf->own;
+		p->user = conf->user;
+		if (conf->tail)
+			conf->tail->next = p;
+		else
+			conf->head = p;
+		conf->tail = p;
+	} else {
+		map_destroy(conf->own);
+		if (conf->cb) {
+			err = conf->cb(conf->section, conf->section_cmd_dir, conf->data);
+			if (err) {
+				conf->section = NULL;
+				conf->own = NULL;
+				return err;
+			}
+		} else {
+			map_destroy(conf->section);
+		}
 	}
+
+	conf->section = NULL;
+	conf->own = NULL;
 
 	return 0;
 }
@@ -61,6 +112,12 @@ static int config_reset(struct config *conf)
 	if (!conf->section)
 		return -ENOMEM;
 
+	conf->own = map_create();
+	if (!conf->own)
+		return -ENOMEM;
+
+	strcpy(conf->section_cmd_dir, conf->global_cmd_dir);
+
 	if (conf->global)
 		return map_copy(conf->section, conf->global);
 
@@ -70,6 +127,7 @@ static int config_reset(struct config *conf)
 static int config_set(struct config *conf, const char *key, const char *value)
 {
 	struct map *map = conf->section;
+	int err;
 
 	if (!map) {
 		if (!conf->global) {
@@ -78,8 +136,18 @@ static int config_set(struct config *conf, const char *key, const char *value)
 				return -ENOMEM;
 		}
 
-		map = conf->global;
+		if (strcmp(key, "command") == 0)
+			strcpy(conf->global_cmd_dir, conf->dir);
+
+		return map_set(conf->global, key, value);
 	}
+
+	if (strcmp(key, "command") == 0)
+		strcpy(conf->section_cmd_dir, conf->dir);
+
+	err = map_set(conf->own, key, value);
+	if (err)
+		return err;
 
 	return map_set(map, key, value);
 }
@@ -138,13 +206,18 @@ static int config_open(struct config *conf, const char *path, const bool single_
 		return err;
 	}
 
+	if (!getcwd(conf->dir, sizeof(conf->dir)))
+		snprintf(conf->dir, sizeof(conf->dir), "%s", dname);
+
 	debug("changed directory to %s", dname);
 
 	err = config_read(conf, fd);
 	sys_close(fd);
 
-	if (single_mode && conf->global)
+	if (single_mode && conf->global) {
 		map_destroy(conf->global);
+		conf->global = NULL;
+	}
 
 	return err;
 }
@@ -195,41 +268,204 @@ int config_load(const char *path, config_cb_t *cb, void *data)
 	return config_open(&conf, buf, true);
 }
 
-int config_dir_load(const char *path, config_cb_t *cb, void *data, const bool quiet)
+struct entry {
+	char name[NAME_MAX + 1];
+	char dir[PATH_MAX];
+	bool user;
+};
+
+static int entry_cmp(const void *a, const void *b)
+{
+	const struct entry *x = a, *y = b;
+	int c = strcmp(x->name, y->name);
+
+	if (c)
+		return c;
+	/* user entry first, so the package one can be skipped */
+	return (int)y->user - (int)x->user;
+}
+
+static int config_scan(const char *path, bool user, bool quiet,
+		       struct entry **list, size_t *len, size_t *cap)
+{
+	struct dirent **namelist;
+	char real[PATH_MAX];
+	int n;
+
+	n = scandir(path, &namelist, NULL, alphasort);
+	if (n < 0) {
+		if (!quiet)
+			perror(path);
+		return -1;
+	}
+
+	if (!realpath(path, real))
+		snprintf(real, sizeof(real), "%s", path);
+
+	for (int i = 0; i < n; i++) {
+		const char *name = namelist[i]->d_name;
+
+		if (strcmp(name, ".") && strcmp(name, "..")) {
+			if (*len == *cap) {
+				size_t ncap = *cap ? *cap * 2 : 32;
+				struct entry *nl = realloc(*list, ncap * sizeof(**list));
+				if (!nl) {
+					while (i < n)
+						free(namelist[i++]);
+					free(namelist);
+					return -ENOMEM;
+				}
+				*list = nl;
+				*cap = ncap;
+			}
+			snprintf((*list)[*len].name, sizeof((*list)[*len].name), "%s", name);
+			snprintf((*list)[*len].dir, sizeof((*list)[*len].dir), "%s", real);
+			(*list)[*len].user = user;
+			(*len)++;
+		}
+		free(namelist[i]);
+	}
+	free(namelist);
+
+	return 0;
+}
+
+static bool same_block(const struct map *a, const struct map *b)
+{
+	const char *an = map_get(a, "name"), *bn = map_get(b, "name");
+	const char *ai = map_get(a, "instance"), *bi = map_get(b, "instance");
+
+	if (!an || !bn || strcmp(an, bn))
+		return false;
+
+	return strcmp(ai ? ai : "", bi ? bi : "") == 0;
+}
+
+static int overlay_cb(const char *key, const char *value, void *data)
+{
+	return map_set(data, key, value);
+}
+
+static int config_resolve(struct config *conf)
+{
+	for (struct pending *u = conf->head; u; u = u->next) {
+		struct pending *base = NULL;
+
+		if (!u->user)
+			continue;
+
+		for (struct pending *p = conf->head; p; p = p->next) {
+			if (p->user || p->dropped || !same_block(p->map, u->map))
+				continue;
+			p->dropped = true;
+			base = p;
+		}
+
+		if (base) {
+			struct map *merged = map_create();
+			int err;
+
+			if (!merged)
+				return -ENOMEM;
+			err = map_copy(merged, base->map);
+			if (!err)
+				err = map_for_each(u->own, overlay_cb, merged);
+			if (err) {
+				map_destroy(merged);
+				return err;
+			}
+			if (!map_get(u->own, "command")) {
+				char *dir = strdup(base->cmd_dir);
+
+				if (!dir) {
+					map_destroy(merged);
+					return -ENOMEM;
+				}
+				free(u->cmd_dir);
+				u->cmd_dir = dir;
+			}
+			map_destroy(u->map);
+			u->map = merged;
+		}
+	}
+
+	return 0;
+}
+
+static void config_free_pending(struct config *conf)
+{
+	struct pending *p = conf->head, *next;
+
+	while (p) {
+		next = p->next;
+		if (p->map)
+			map_destroy(p->map);
+		map_destroy(p->own);
+		free(p->cmd_dir);
+		free(p);
+		p = next;
+	}
+	conf->head = conf->tail = NULL;
+}
+
+int config_layers_load(const char *user_dir, const char *pkg_dir,
+		       config_cb_t *cb, void *data)
 {
 	struct config conf = {
 		.data = data,
 		.cb = cb,
+		.collect = true,
 	};
-
+	struct entry *list = NULL;
+	size_t len = 0, cap = 0;
+	int found = 0, err = 0;
 	char buf[PATH_MAX];
-	struct dirent **namelist;
-	int n, err, retval = 0;
 
-	n = scandir(path, &namelist, NULL, alphasort);
-	if (n < 0) {
-		if (!quiet) perror(path);
-		retval = -1;
-	} else {
-		for (int i=0; i < n; i++) {			
-			char *conf_file = namelist[i]->d_name;
-			if (strcmp(conf_file, ".") != 0 && strcmp(conf_file, "..") != 0) {
-				snprintf(buf, sizeof(buf), "%s/%s", path, conf_file);
-				debug("Reading config file %s\n", buf);
-				err = config_open(&conf, buf, false);
+	if (user_dir && config_scan(user_dir, true, true, &list, &len, &cap) == 0)
+		found++;
+	if (pkg_dir && config_scan(pkg_dir, false, false, &list, &len, &cap) == 0)
+		found++;
 
-				if (err) {
-					error("failed to load config file %s", conf_file);
-					return err;
-				}
-			}
-			free(namelist[i]);
-		}
-		free(namelist);
+	if (!found) {
+		free(list);
+		return -1;
 	}
 
+	qsort(list, len, sizeof(*list), entry_cmp);
+
+	for (size_t i = 0; i < len; i++) {
+		if (i > 0 && strcmp(list[i].name, list[i - 1].name) == 0)
+			continue; /* masked by the user file of the same name */
+
+		snprintf(buf, sizeof(buf), "%s/%s", list[i].dir, list[i].name);
+		debug("Reading config file %s", buf);
+		conf.user = list[i].user;
+		err = config_open(&conf, buf, false);
+		if (err) {
+			error("failed to load config file %s", buf);
+			break;
+		}
+	}
+
+	free(list);
 	if (conf.global)
 		map_destroy(conf.global);
+	if (conf.section) {
+		map_destroy(conf.section);
+		map_destroy(conf.own);
+	}
 
-    return retval;
+	if (!err)
+		err = config_resolve(&conf);
+
+	for (struct pending *p = conf.head; p && !err; p = p->next) {
+		if (p->dropped)
+			continue;
+		err = cb(p->map, p->cmd_dir, data);
+		p->map = NULL; /* owned by the callback now */
+	}
+
+	config_free_pending(&conf);
+
+	return err;
 }

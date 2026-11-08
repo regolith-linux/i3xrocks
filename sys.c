@@ -142,6 +142,20 @@ int sys_waitanychild(void)
 	return 0;
 }
 
+int sys_kill(pid_t pid, int sig)
+{
+	int rc;
+
+	rc = kill(pid, sig);
+	if (rc == -1) {
+		sys_errno("kill(%d, %d (%s))", pid, sig, strsignal(sig));
+		rc = -errno;
+		return rc;
+	}
+
+	return 0;
+}
+
 int sys_setenv(const char *name, const char *value)
 {
 	int rc;
@@ -241,6 +255,38 @@ int sys_sigwaitinfo(sigset_t *set, int *sig, int *fd)
 
 	*sig = rc;
 	*fd = siginfo.si_fd;
+
+	return 0;
+}
+
+/* Discard every pending instance of a blocked signal */
+int sys_sigflush(int sig)
+{
+	const struct timespec timeout = { 0 };
+	sigset_t set;
+	int rc;
+
+	rc = sigemptyset(&set);
+	if (rc == 0)
+		rc = sigaddset(&set, sig);
+	if (rc == -1) {
+		sys_errno("sigaddset(%d (%s))", sig, strsignal(sig));
+		rc = -errno;
+		return rc;
+	}
+
+	for (;;) {
+		rc = sigtimedwait(&set, NULL, &timeout);
+		if (rc == -1) {
+			if (errno == EAGAIN)
+				break;
+			if (errno == EINTR)
+				continue;
+			sys_errno("sigtimedwait(%d (%s))", sig, strsignal(sig));
+			rc = -errno;
+			return rc;
+		}
+	}
 
 	return 0;
 }
