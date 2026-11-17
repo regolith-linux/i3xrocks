@@ -406,6 +406,7 @@ static void bar_destroy(struct bar *bar)
 		block = next;
 	}
 
+	free(bar->skipped);
 	free(bar);
 }
 
@@ -453,28 +454,58 @@ static int bar_config_cb(struct map *map, void *data)
 	return 0;
 }
 
+/* Collect the base names of the files which were skipped or partially loaded */
+static int bar_skip_cb(const char *path, void *data)
+{
+	struct bar *bar = data;
+	const char *name = strrchr(path, '/');
+	size_t len = bar->skipped ? strlen(bar->skipped) : 0;
+	char *skipped;
+
+	name = name ? name + 1 : path;
+
+	skipped = realloc(bar->skipped, len + strlen(", ") + strlen(name) + 1);
+	if (!skipped)
+		return -ENOMEM;
+
+	sprintf(skipped + len, "%s%s", len ? ", " : "", name);
+	bar->skipped = skipped;
+
+	return 0;
+}
+
 static void bar_load(struct bar *bar, const char *path, const char *conf_dir, const char *user_conf_dir)
 {
-	int err;
+	struct block *status = bar->blocks;
+	int err = 0;
 
 	if (path) {
 		debug("Loading config from file %s", path);
-		err = config_load(path, bar_config_cb, bar);
+		err = config_load(path, bar_config_cb, bar_skip_cb, bar);
 	} else if (conf_dir || user_conf_dir) {
 		if (user_conf_dir) {
 			debug("Loading config from user directory %s", user_conf_dir);
-			err = config_dir_load(user_conf_dir, bar_config_cb, bar, true);
+			err = config_dir_load(user_conf_dir, bar_config_cb, bar_skip_cb, bar, true);
 		}
 
 		// If attempt at user conf failed and have system conf, or only have system conf:
 		if ((err && user_conf_dir && conf_dir) || (conf_dir && !user_conf_dir)) {
 			debug("Loading config from directory %s", conf_dir);
-			err = config_dir_load(conf_dir, bar_config_cb, bar, false);
+			err = config_dir_load(conf_dir, bar_config_cb, bar_skip_cb, bar, false);
 		}
 	}
 
 	if (err)
-		bar_fatal(bar, "Failed to load configuration.");
+		bar_fatal(bar, "Failed to load configuration");
+	else if (bar->skipped)
+		bar_fatal(bar, "Configuration errors in %s", bar->skipped);
+	else
+		return;
+
+	/* Keep the message for the whole run: the setup resets the blocks */
+	err = map_copy(status->config, status->env);
+	if (err)
+		error("failed to keep the configuration message");
 }
 
 int bar_init(bool term, const char *path, const char *conf_dir, const char *user_conf_dir)

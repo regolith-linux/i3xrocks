@@ -14,6 +14,10 @@ color=xresource:blockColor
 
 ---
 
+3. Invalid lines and unreadable files in the configuration are skipped one by one, and the rest of the
+configuration is loaded.  The bar then shows an urgent first block naming the files with errors; run
+i3xrocks with `-v` or check its standard error for the details.
+
 Otherwise this aims to be identical to i3blocks.  Please refer to the upstream project for documentation.
 
 [source,ini]

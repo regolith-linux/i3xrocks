@@ -19,6 +19,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 #include <dirent.h>
 
 #include "config.h"
@@ -35,6 +36,7 @@ struct config {
 	struct map *section;
 	struct map *global;
 	config_cb_t *cb;
+	config_skip_cb_t *skip_cb;
 	void *data;
 };
 
@@ -104,16 +106,37 @@ static int config_ini_property_cb(char *key, char *value, void *data)
 	return config_set(data, key, value);
 }
 
+static int config_skip(struct config *conf, const char *path)
+{
+	if (!conf->skip_cb)
+		return 0;
+
+	return conf->skip_cb(path, conf->data);
+}
+
+/* Return the number of invalid lines ignored, or a negative error code */
 static int config_read(struct config *conf, int fd)
 {
+	int skipped;
 	int err;
 
-	err = ini_read(fd, -1, config_ini_section_cb, config_ini_property_cb,
-		       conf);
-	if (err && err != -EAGAIN)
+	skipped = ini_read(fd, -1, config_ini_section_cb, config_ini_property_cb,
+			   conf);
+	if (skipped < 0) {
+		/* Drop an incomplete section, so that the next file does not extend it */
+		if (conf->section) {
+			map_destroy(conf->section);
+			conf->section = NULL;
+		}
+
+		return skipped;
+	}
+
+	err = config_finalize(conf);
+	if (err)
 		return err;
 
-	return config_finalize(conf);
+	return skipped;
 }
 
 static int config_open(struct config *conf, const char *path, const bool single_mode)
@@ -143,13 +166,21 @@ static int config_open(struct config *conf, const char *path, const bool single_
 	err = config_read(conf, fd);
 	sys_close(fd);
 
-	if (single_mode && conf->global)
+	if (single_mode && conf->global) {
 		map_destroy(conf->global);
+		conf->global = NULL;
+	}
+
+	if (err > 0) {
+		error("ignored %d invalid line(s) in %s", err, path);
+		err = config_skip(conf, path);
+	}
 
 	return err;
 }
 
-int config_load(const char *path, config_cb_t *cb, void *data)
+int config_load(const char *path, config_cb_t *cb, config_skip_cb_t *skip_cb,
+		void *data)
 {
 	const char * const home = sys_getenv("HOME");
 	const char * const xdg_home = sys_getenv("XDG_CONFIG_HOME");
@@ -157,6 +188,7 @@ int config_load(const char *path, config_cb_t *cb, void *data)
 	struct config conf = {
 		.data = data,
 		.cb = cb,
+		.skip_cb = skip_cb,
 	};
 	char buf[PATH_MAX];
 	int err;
@@ -195,11 +227,13 @@ int config_load(const char *path, config_cb_t *cb, void *data)
 	return config_open(&conf, buf, true);
 }
 
-int config_dir_load(const char *path, config_cb_t *cb, void *data, const bool quiet)
+int config_dir_load(const char *path, config_cb_t *cb, config_skip_cb_t *skip_cb,
+		    void *data, const bool quiet)
 {
 	struct config conf = {
 		.data = data,
 		.cb = cb,
+		.skip_cb = skip_cb,
 	};
 
 	char buf[PATH_MAX];
@@ -213,14 +247,15 @@ int config_dir_load(const char *path, config_cb_t *cb, void *data, const bool qu
 	} else {
 		for (int i=0; i < n; i++) {			
 			char *conf_file = namelist[i]->d_name;
-			if (strcmp(conf_file, ".") != 0 && strcmp(conf_file, "..") != 0) {
+			if (!retval && strcmp(conf_file, ".") != 0 && strcmp(conf_file, "..") != 0) {
 				snprintf(buf, sizeof(buf), "%s/%s", path, conf_file);
 				debug("Reading config file %s\n", buf);
 				err = config_open(&conf, buf, false);
 
+				/* An unreadable file must not discard the others */
 				if (err) {
-					error("failed to load config file %s", conf_file);
-					return err;
+					error("failed to load config file %s, skipping it", conf_file);
+					retval = config_skip(&conf, buf);
 				}
 			}
 			free(namelist[i]);

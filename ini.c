@@ -17,6 +17,7 @@
  */
 
 #include <ctype.h>
+#include <stdbool.h>
 #include <string.h>
 #include <xcb/xcb.h>
 #include <xcb/xcb_xrm.h>
@@ -31,6 +32,8 @@ struct ini {
 	ini_prop_cb_t *prop_cb;
 	void *data;
 	xcb_xrm_database_t *database;
+	unsigned int skipped;
+	bool orphan;
 };
 
 static int ini_section(struct ini *ini, char *section)
@@ -77,8 +80,21 @@ static int ini_property(struct ini *ini, char *key, char *value)
 	return ini->prop_cb(key, value, ini->data);
 }
 
+/* Count an invalid line; after an invalid section, ignore its properties */
+static int ini_skip(struct ini *ini, bool section)
+{
+	ini->skipped++;
+
+	if (section)
+		ini->orphan = true;
+
+	return 0;
+}
+
 static int ini_parse_line(char *line, size_t num, void *data)
 {
+	struct ini *ini = data;
+
 	/* comment or empty line? */
 	if (*line == '\0' || *line == '#')
 		return 0;
@@ -89,19 +105,22 @@ static int ini_parse_line(char *line, size_t num, void *data)
 
 		closing = strchr(line, ']');
 		if (!closing) {
-			error("malformated section \"%s\"", line);
-			return -EINVAL;
+			error("line %zu: malformed section \"%s\", ignoring it",
+			      num + 1, line);
+			return ini_skip(ini, true);
 		}
 
 		if (*(closing + 1) != '\0') {
-			error("trailing characters \"%s\"", closing);
-			return -EINVAL;
+			error("line %zu: trailing characters \"%s\", ignoring the section",
+			      num + 1, closing);
+			return ini_skip(ini, true);
 		}
 
 		section = line + 1;
 		*closing = '\0';
+		ini->orphan = false;
 
-		return ini_section(data, section);
+		return ini_section(ini, section);
 	}
 
 	/* property? */
@@ -110,19 +129,27 @@ static int ini_parse_line(char *line, size_t num, void *data)
 
 		equals = strchr(line, '=');
 		if (!equals) {
-			error("malformated property, should be a key=value pair");
-			return -EINVAL;
+			error("line %zu: malformed property \"%s\", should be a key=value pair",
+			      num + 1, line);
+			return ini_skip(ini, false);
+		}
+
+		/* Neither the previous section nor the globals get these */
+		if (ini->orphan) {
+			debug("line %zu: ignoring property \"%s\" of an invalid section",
+			      num + 1, line);
+			return 0;
 		}
 
 		*equals = '\0';
 		key = line;
 		value = equals + 1;
 
-		return ini_property(data, key, value);
+		return ini_property(ini, key, value);
 	}
 
-	error("invalid INI syntax for line: \"%s\"", line);
-	return -EINVAL;
+	error("line %zu: invalid INI syntax \"%s\", ignoring it", num + 1, line);
+	return ini_skip(ini, false);
 }
 
 int ini_read(int fd, size_t count, ini_sec_cb_t *sec_cb, ini_prop_cb_t *prop_cb,
@@ -140,11 +167,14 @@ int ini_read(int fd, size_t count, ini_sec_cb_t *sec_cb, ini_prop_cb_t *prop_cb,
 		.database = xdatabase
 	};
 
-	int val = line_read(fd, count, ini_parse_line, &ini);
+	int err = line_read(fd, count, ini_parse_line, &ini);
 
 	xcb_xrm_database_free(xdatabase);
 
 	xcb_disconnect(conn);
 
-	return val;
+	if (err && err != -EAGAIN)
+		return err;
+
+	return ini.skipped;
 }

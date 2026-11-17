@@ -21,6 +21,7 @@
 
 typedef int ini_sec_cb_t(char *section, void *data);
 typedef int ini_prop_cb_t(char *key, char *value, void *data);
+/* Return the number of invalid lines ignored, or a negative error code */
 int ini_read(int fd, size_t count, ini_sec_cb_t *sec_cb, ini_prop_cb_t *prop_cb,
 	     void *data);
 

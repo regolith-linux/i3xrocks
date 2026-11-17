@@ -28,6 +28,9 @@ struct bar {
 	struct block *blocks;
 	sigset_t sigset;
 	bool term;
+
+	/* Base names of the configuration files with errors */
+	char *skipped;
 };
 
 #define bar_printf(bar, lvl, fmt, ...) \
