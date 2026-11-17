@@ -35,43 +35,71 @@
 /*
  * The resources are fetched by a helper process, so that an X server which
  * accepts the connection but never answers cannot hold the bar: past the
- * startup delay, every resource is considered unset. The helper writes its
- * result to a pipe as a type byte followed by the resources, if any, and a
- * null byte.
+ * startup delay, every resource is considered unset. The helper then keeps
+ * looking for a display, and reports the resources of the first one holding
+ * some, which the bar adopts.
+ *
+ * Each attempt runs in a child process of the helper and writes its result
+ * to a pipe, as a type byte followed by the resources, if any, and a null
+ * byte. The helper writes the results it reports to the bar the same way.
  */
 
 /* Time given to the X server to provide its resources, from startup */
 #define XRES_STARTUP_MSEC	1000
 
-/* Time after which the helper gives up on a silent server */
+/* Without resources, look for a display again this often */
+#define XRES_RETRY_MSEC		2000
+
+/* Time after which an attempt gives up on a silent server */
 #define XRES_ATTEMPT_SEC	10
+
+/* Attempts held by silent servers at the same time, at most */
+#define XRES_ATTEMPTS_MAX	(XRES_ATTEMPT_SEC * 1000 / XRES_RETRY_MSEC + 1)
 
 #define XRES_NONE	'N'	/* no usable display */
 #define XRES_STORE	'S'	/* the RESOURCE_MANAGER property of the server */
 #define XRES_FILES	'F'	/* the resource files, the server holds none */
 
-static struct {
-	struct timespec deadline;
-	bool queried;
+/* Messages read from a pipe */
+struct xres_msgs {
 	int fd;
 	char *buf;
 	size_t len;
-	xcb_xrm_database_t *database;
-} xres = {
-	.fd = -1,
+	size_t used;	/* by the message returned last */
 };
 
-static long xres_msec_left(const struct timespec *ts)
+static struct {
+	struct timespec deadline;
+	bool queried;
+	struct xres_msgs helper;
+	xcb_xrm_database_t *database;
+} xres = {
+	.helper.fd = -1,
+};
+
+static void xres_add_msec(struct timespec *ts, long msec)
+{
+	ts->tv_sec += msec / 1000;
+	ts->tv_nsec += (msec % 1000) * 1000000;
+	if (ts->tv_nsec >= 1000000000) {
+		ts->tv_sec++;
+		ts->tv_nsec -= 1000000000;
+	}
+}
+
+/* Milliseconds until ts, rounded up, or 0 if reached */
+static int xres_msec_left(const struct timespec *ts)
 {
 	struct timespec now;
-	long msec;
+	long long nsec;
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
 
-	msec = (ts->tv_sec - now.tv_sec) * 1000 +
-	       (ts->tv_nsec - now.tv_nsec + 999999) / 1000000;
+	nsec = (ts->tv_sec - now.tv_sec) * 1000000000LL + ts->tv_nsec - now.tv_nsec;
+	if (nsec <= 0)
+		return 0;
 
-	return msec > 0 ? msec : 0;
+	return (nsec + 999999) / 1000000;
 }
 
 int xres_init(void)
@@ -79,12 +107,7 @@ int xres_init(void)
 	if (clock_gettime(CLOCK_MONOTONIC, &xres.deadline))
 		return -errno;
 
-	xres.deadline.tv_sec += XRES_STARTUP_MSEC / 1000;
-	xres.deadline.tv_nsec += (XRES_STARTUP_MSEC % 1000) * 1000000;
-	if (xres.deadline.tv_nsec >= 1000000000) {
-		xres.deadline.tv_sec++;
-		xres.deadline.tv_nsec -= 1000000000;
-	}
+	xres_add_msec(&xres.deadline, XRES_STARTUP_MSEC);
 
 	return 0;
 }
@@ -108,6 +131,65 @@ static int xres_write(int fd, const char *buf, size_t len)
 	return 0;
 }
 
+static int xres_send(int fd, char type, const char *str)
+{
+	int err;
+
+	err = xres_write(fd, &type, 1);
+	if (!err && str)
+		err = xres_write(fd, str, strlen(str));
+	if (!err)
+		err = xres_write(fd, "", 1);
+
+	return err;
+}
+
+/*
+ * Read from a pipe; return 1 and point to the next message, without its
+ * terminating null byte, 0 at the end, or a negative error code (-EAGAIN
+ * without a complete message yet). The message is valid until the next call.
+ */
+static int xres_recv(struct xres_msgs *msgs, char **msg)
+{
+	char buf[4096];
+	char *end, *tmp;
+	ssize_t n;
+
+	/* Drop the message returned last time */
+	if (msgs->used) {
+		msgs->len -= msgs->used;
+		memmove(msgs->buf, msgs->buf + msgs->used, msgs->len);
+		msgs->used = 0;
+	}
+
+	for (;;) {
+		end = msgs->len ? memchr(msgs->buf, '\0', msgs->len) : NULL;
+		if (end) {
+			*msg = msgs->buf;
+			msgs->used = end + 1 - msgs->buf;
+			return 1;
+		}
+
+		n = read(msgs->fd, buf, sizeof(buf));
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -errno;
+		}
+
+		if (n == 0)
+			return 0;
+
+		tmp = realloc(msgs->buf, msgs->len + n);
+		if (!tmp)
+			return -ENOMEM;
+
+		memcpy(tmp + msgs->len, buf, n);
+		msgs->buf = tmp;
+		msgs->len += n;
+	}
+}
+
 /* Fetch the resources and write them to fd, in a child process */
 static void xres_attempt(int fd)
 {
@@ -116,6 +198,10 @@ static void xres_attempt(int fd)
 	xcb_screen_t *screen;
 	char type = XRES_NONE;
 	char *str = NULL;
+
+	/* Give up on a silent server */
+	signal(SIGALRM, SIG_DFL);
+	alarm(XRES_ATTEMPT_SEC);
 
 	/* Without a server, don't look for resource files either */
 	conn = xcb_connect(NULL, NULL);
@@ -142,11 +228,58 @@ static void xres_attempt(int fd)
 	}
 	xcb_disconnect(conn);
 
-	if (xres_write(fd, &type, 1) == 0 && str)
-		xres_write(fd, str, strlen(str));
-	xres_write(fd, "", 1);
-
+	xres_send(fd, type, str);
 	free(str);
+}
+
+struct xres_attempt {
+	struct xres_msgs msgs;
+	pid_t pid;
+	bool first;
+};
+
+static int xres_attempt_spawn(struct xres_attempt *attempt, int out)
+{
+	int fds[2];
+	pid_t pid;
+
+	if (pipe(fds))
+		return -errno;
+
+	pid = fork();
+	if (pid < 0) {
+		close(fds[0]);
+		close(fds[1]);
+		return -errno;
+	}
+
+	if (pid == 0) {
+		/* The bar sees the end of the helper as soon as it exits */
+		close(out);
+		close(fds[0]);
+		xres_attempt(fds[1]);
+		_exit(0);
+	}
+
+	close(fds[1]);
+	fcntl(fds[0], F_SETFL, O_NONBLOCK);
+
+	attempt->msgs = (struct xres_msgs) { .fd = fds[0] };
+	attempt->pid = pid;
+
+	return 0;
+}
+
+static void xres_attempt_end(struct xres_attempt *attempt, bool kill_it)
+{
+	if (kill_it)
+		kill(attempt->pid, SIGKILL);
+
+	while (waitpid(attempt->pid, NULL, 0) < 0 && errno == EINTR)
+		continue;
+
+	close(attempt->msgs.fd);
+	free(attempt->msgs.buf);
 }
 
 /* Set up the helper process, apart from the bar */
@@ -174,19 +307,91 @@ static void xres_helper_init(void)
 	for (sig = SIGRTMIN; sig <= SIGRTMAX; sig++)
 		signal(sig, SIG_IGN);
 
+	/* Writing once the bar is gone fails, the attempts are then cleaned up */
+	signal(SIGPIPE, SIG_IGN);
+
 	sigemptyset(&set);
 	sigprocmask(SIG_SETMASK, &set, NULL);
 }
 
-static void xres_helper(int fd)
+/*
+ * Report to the bar the result of the first attempt, if it comes within the
+ * startup delay, then the first resources held by a server, and exit.
+ */
+static void xres_helper(int out)
 {
+	static char none[] = { XRES_NONE, '\0' };
+	struct xres_attempt attempts[XRES_ATTEMPTS_MAX];
+	struct pollfd pfds[1 + XRES_ATTEMPTS_MAX];
+	struct timespec next;
+	bool first = true;
+	bool done = false;
+	int i, n = 0;
+	char *msg;
+	int err;
+
 	xres_helper_init();
-	signal(SIGALRM, SIG_DFL);
 
-	/* Give up on a silent server */
-	alarm(XRES_ATTEMPT_SEC);
+	clock_gettime(CLOCK_MONOTONIC, &next);
 
-	xres_attempt(fd);
+	while (!done) {
+		if (n < XRES_ATTEMPTS_MAX && xres_msec_left(&next) == 0) {
+			attempts[n].first = first;
+			if (xres_attempt_spawn(&attempts[n], out) == 0) {
+				first = false;
+				n++;
+			}
+
+			clock_gettime(CLOCK_MONOTONIC, &next);
+			xres_add_msec(&next, XRES_RETRY_MSEC);
+		}
+
+		/* Errors on the pipe tell that the bar is gone */
+		pfds[0].fd = out;
+		pfds[0].events = 0;
+		for (i = 0; i < n; i++) {
+			pfds[1 + i].fd = attempts[i].msgs.fd;
+			pfds[1 + i].events = POLLIN;
+		}
+
+		/* With every attempt held, wait for one to end (alarm) */
+		err = poll(pfds, 1 + n, n < XRES_ATTEMPTS_MAX ? xres_msec_left(&next) : -1);
+		if (err < 0 && errno != EINTR)
+			break;
+		if (err <= 0)
+			continue;
+
+		if (pfds[0].revents)
+			break;
+
+		for (i = n - 1; i >= 0; i--) {
+			if (!pfds[1 + i].revents)
+				continue;
+
+			err = xres_recv(&attempts[i].msgs, &msg);
+			if (err == -EAGAIN)
+				continue;
+
+			/* Killed (by its alarm) without a result */
+			if (err <= 0)
+				msg = none;
+
+			if (attempts[i].first && xres_msec_left(&xres.deadline) > 0) {
+				xres_send(out, msg[0], msg + 1);
+				done = msg[0] != XRES_NONE;
+			} else if (msg[0] == XRES_STORE) {
+				/* A display found later on, or after a slow answer */
+				xres_send(out, msg[0], msg + 1);
+				done = true;
+			}
+
+			xres_attempt_end(&attempts[i], false);
+			attempts[i] = attempts[--n];
+		}
+	}
+
+	for (i = 0; i < n; i++)
+		xres_attempt_end(&attempts[i], true);
 }
 
 /* Start the helper, detached so that the bar never waits for it */
@@ -210,8 +415,7 @@ static int xres_spawn(void)
 	if (pid == 0) {
 		close(fds[0]);
 
-		pid = fork();
-		if (pid == 0)
+		if (fork() == 0)
 			xres_helper(fds[1]);
 
 		_exit(0);
@@ -222,7 +426,7 @@ static int xres_spawn(void)
 	while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
 		continue;
 
-	xres.fd = fds[0];
+	xres.helper.fd = fds[0];
 
 	return 0;
 err:
@@ -232,87 +436,50 @@ err:
 	return -errno;
 }
 
-/* Use resources from the helper, a message without them means none */
-static void xres_use(char type, const char *str)
+/* Use the resources of a message from the helper, if any */
+static bool xres_use(const char *msg)
 {
 	xcb_xrm_database_t *database;
 
-	if (type != XRES_STORE && type != XRES_FILES)
-		return;
+	if (msg[0] != XRES_STORE && msg[0] != XRES_FILES)
+		return false;
 
-	database = xcb_xrm_database_from_string(str);
+	database = xcb_xrm_database_from_string(msg + 1);
 	if (!database) {
 		error("failed to parse the Xresources");
-		return;
+		return false;
 	}
 
 	if (xres.database)
 		xcb_xrm_database_free(xres.database);
 
 	xres.database = database;
+
+	return true;
 }
 
-/* Read from the helper; return 1 after a message, 0 at the end, or an error */
-static int xres_read(void)
-{
-	char buf[4096];
-	char *end, *tmp;
-	ssize_t n;
-	size_t len;
-
-	for (;;) {
-		/* A complete message? */
-		end = xres.buf ? memchr(xres.buf, '\0', xres.len) : NULL;
-		if (end) {
-			xres_use(xres.buf[0], xres.buf + 1);
-
-			len = xres.len - (end + 1 - xres.buf);
-			memmove(xres.buf, end + 1, len);
-			xres.len = len;
-
-			return 1;
-		}
-
-		n = read(xres.fd, buf, sizeof(buf));
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			return -errno;
-		}
-
-		if (n == 0)
-			return 0;
-
-		tmp = realloc(xres.buf, xres.len + n);
-		if (!tmp)
-			return -ENOMEM;
-
-		memcpy(tmp + xres.len, buf, n);
-		xres.buf = tmp;
-		xres.len += n;
-	}
-}
-
-/* Wait for the result of the helper, until the end of the startup delay */
+/* Wait for the first result of the helper, until the end of the startup delay */
 static void xres_query(void)
 {
-	struct pollfd pfd;
 	const char *display = getenv("DISPLAY");
+	struct pollfd pfd;
+	char *msg;
 	int err;
 
-	xres.queried = true;
-
 	/* No display can show up later on either */
-	if (!display || *display == '\0')
+	if (!display || *display == '\0') {
+		xres.queried = true;
 		return;
+	}
 
 	err = xres_spawn();
+	xres.queried = true;
 	if (err) {
 		error("failed to query Xresources: %s", strerror(-err));
 		return;
 	}
 
-	pfd.fd = xres.fd;
+	pfd.fd = xres.helper.fd;
 	pfd.events = POLLIN;
 
 	for (;;) {
@@ -322,16 +489,24 @@ static void xres_query(void)
 
 		if (err <= 0) {
 			trace("Xresources unavailable within the startup delay");
-			break;
+			return;
 		}
 
-		/* Until a complete message, or the end */
-		if (xres_read() != -EAGAIN)
+		err = xres_recv(&xres.helper, &msg);
+		if (err == -EAGAIN)
+			continue;
+
+		/* Resources found, or the helper is gone */
+		if (err <= 0 || xres_use(msg))
 			break;
+
+		/* No display, the helper keeps looking */
+		trace("Xresources unavailable, looking for a display");
+		return;
 	}
 
-	close(xres.fd);
-	xres.fd = -1;
+	close(xres.helper.fd);
+	xres.helper.fd = -1;
 }
 
 char *xres_get(const char *name)
@@ -353,17 +528,43 @@ char *xres_get(const char *name)
 	return value;
 }
 
+int xres_watch(void)
+{
+	return xres.helper.fd;
+}
+
+bool xres_update(void)
+{
+	bool adopted = false;
+	char *msg;
+	int err;
+
+	if (xres.helper.fd < 0)
+		return false;
+
+	while ((err = xres_recv(&xres.helper, &msg)) == 1)
+		adopted |= xres_use(msg);
+
+	if (err != -EAGAIN && err != 0)
+		error("failed to read Xresources: %s", strerror(-err));
+
+	if (adopted)
+		debug("Xresources available");
+
+	return adopted;
+}
+
 void xres_free(void)
 {
 	if (xres.database)
 		xcb_xrm_database_free(xres.database);
 	xres.database = NULL;
 
-	if (xres.fd >= 0)
-		close(xres.fd);
-	xres.fd = -1;
+	if (xres.helper.fd >= 0)
+		close(xres.helper.fd);
+	xres.helper.fd = -1;
 
-	free(xres.buf);
-	xres.buf = NULL;
-	xres.len = 0;
+	free(xres.helper.buf);
+	xres.helper.buf = NULL;
+	xres.helper.len = 0;
 }

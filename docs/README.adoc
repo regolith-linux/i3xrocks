@@ -24,6 +24,10 @@ color=xresource:blockColor #FFFFFF
 
 ---
 
+Without a usable display at startup, i3xrocks keeps looking for one every two seconds.  As soon as a
+display provides its resources (the `RESOURCE_MANAGER` property, as loaded by `xrdb`), the properties
+naming resources follow them, without a restart.
+
 3. Invalid lines and unreadable files in the configuration are skipped one by one, and the rest of the
 configuration is loaded.  The bar then shows an urgent first block naming the files with errors; run
 i3xrocks with `-v` or check its standard error for the details.

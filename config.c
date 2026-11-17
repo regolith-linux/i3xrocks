@@ -35,9 +35,18 @@
 
 #define CONFIG_XRESOURCE "xresource:"
 
+/*
+ * A property set from X resources is resolved again when a display shows up
+ * later on. Next to each map of properties, an "xres" map keeps what each such
+ * property is made of, as lines: first "=<value>" or "-", for the value it had
+ * before (from a plain line or the globals) or none, then each
+ * "<resource>[ <default>]" in order. A plain line replaces them.
+ */
 struct config {
 	struct map *section;
+	struct map *section_xres;
 	struct map *global;
+	struct map *global_xres;
 	config_cb_t *cb;
 	config_skip_cb_t *skip_cb;
 	void *data;
@@ -49,7 +58,8 @@ static int config_finalize(struct config *conf)
 
 	if (conf->section) {
 		if (conf->cb) {
-			err = conf->cb(conf->section, conf->data);
+			err = conf->cb(conf->section, conf->section_xres, conf->data);
+			conf->section_xres = NULL;
 			if (err)
 				return err;
 		}
@@ -62,9 +72,21 @@ static int config_finalize(struct config *conf)
 
 static int config_reset(struct config *conf)
 {
+	int err;
+
 	conf->section = map_create();
 	if (!conf->section)
 		return -ENOMEM;
+
+	if (conf->global_xres) {
+		conf->section_xres = map_create();
+		if (!conf->section_xres)
+			return -ENOMEM;
+
+		err = map_copy(conf->section_xres, conf->global_xres);
+		if (err)
+			return err;
+	}
 
 	if (conf->global)
 		return map_copy(conf->section, conf->global);
@@ -72,7 +94,7 @@ static int config_reset(struct config *conf)
 	return 0;
 }
 
-static int config_set(struct config *conf, const char *key, const char *value)
+static int config_store(struct config *conf, const char *key, const char *value)
 {
 	struct map *map = conf->section;
 
@@ -87,6 +109,69 @@ static int config_set(struct config *conf, const char *key, const char *value)
 	}
 
 	return map_set(map, key, value);
+}
+
+static int config_set(struct config *conf, const char *key, const char *value)
+{
+	struct map *xres = conf->section ? conf->section_xres : conf->global_xres;
+	int err;
+
+	/* A plain value replaces the resources named before */
+	if (xres && map_get(xres, key)) {
+		err = map_set(xres, key, NULL);
+		if (err)
+			return err;
+	}
+
+	return config_store(conf, key, value);
+}
+
+int config_xresource(const char *lines, char **value)
+{
+	char *buf, *line, *def;
+	int err = 0;
+
+	*value = NULL;
+
+	buf = strdup(lines);
+	if (!buf)
+		return -ENOMEM;
+
+	/* The last resource which is defined, or has a default, wins */
+	for (;;) {
+		line = strrchr(buf, '\n');
+		if (!line) {
+			/* None, the former value stays */
+			if (*buf == '=') {
+				*value = strdup(buf + 1);
+				if (!*value)
+					err = -ENOMEM;
+			}
+			break;
+		}
+
+		*line++ = '\0';
+
+		/* Split at the first space */
+		def = strchr(line, ' ');
+		if (def)
+			*def++ = '\0';
+
+		*value = xres_get(line);
+		if (*value)
+			break;
+
+		if (def && *def != '\0') {
+			*value = strdup(def);
+			if (!*value)
+				err = -ENOMEM;
+			break;
+		}
+	}
+
+	free(buf);
+
+	return err;
 }
 
 static int config_ini_section_cb(char *section, void *data)
@@ -104,31 +189,62 @@ static int config_ini_section_cb(char *section, void *data)
 	return config_set(data, "name", section);
 }
 
-/* Set a property from "<resource>[ <default>]", or leave it unset */
-static int config_set_xresource(struct config *conf, const char *key, char *spec)
+/* Set a property from "<resource>[ <default>]", or leave it as it is */
+static int config_set_xresource(struct config *conf, const char *key, const char *spec)
 {
-	char *value, *def;
+	struct map **xres = conf->section ? &conf->section_xres : &conf->global_xres;
+	struct map *map = conf->section ? conf->section : conf->global;
+	const char *lines, *def, *prev = NULL;
+	char *buf, *name, *value;
+	size_t len;
 	int err;
 
-	/* Split at the first space */
-	def = strchr(spec, ' ');
-	if (def)
-		*def++ = '\0';
-
-	value = xres_get(spec);
-	if (value) {
-		err = config_set(conf, key, value);
-		free(value);
-		return err;
+	if (!*xres) {
+		*xres = map_create();
+		if (!*xres)
+			return -ENOMEM;
 	}
 
-	if (def && *def != '\0')
-		return config_set(conf, key, def);
+	lines = map_get(*xres, key);
+	if (!lines) {
+		prev = map ? map_get(map, key) : NULL;
+		lines = prev ? "=" : "-";
+	}
 
-	error("Xresource \"%s\" is not defined and has no default, ignoring %s",
-	      spec, key);
+	len = strlen(lines) + (prev ? strlen(prev) : 0) + strlen(spec) + 2;
+	buf = malloc(len);
+	if (!buf)
+		return -ENOMEM;
 
-	return 0;
+	snprintf(buf, len, "%s%s\n%s", lines, prev ? prev : "", spec);
+	err = map_set(*xres, key, buf);
+	free(buf);
+	if (err)
+		return err;
+
+	/* Without a default, the resource must be defined */
+	def = strchr(spec, ' ');
+	if (!def || def[1] == '\0') {
+		name = strndup(spec, def ? (size_t) (def - spec) : strlen(spec));
+		if (!name)
+			return -ENOMEM;
+
+		value = xres_get(name);
+		if (!value)
+			error("Xresource \"%s\" is not defined and has no default, ignoring %s",
+			      name, key);
+		free(value);
+		free(name);
+	}
+
+	err = config_xresource(map_get(*xres, key), &value);
+	if (err || !value)
+		return err;
+
+	err = config_store(conf, key, value);
+	free(value);
+
+	return err;
 }
 
 static int config_ini_property_cb(char *key, char *value, void *data)
@@ -161,6 +277,11 @@ static int config_read(struct config *conf, int fd)
 		if (conf->section) {
 			map_destroy(conf->section);
 			conf->section = NULL;
+		}
+
+		if (conf->section_xres) {
+			map_destroy(conf->section_xres);
+			conf->section_xres = NULL;
 		}
 
 		return skipped;
@@ -203,6 +324,11 @@ static int config_open(struct config *conf, const char *path, const bool single_
 	if (single_mode && conf->global) {
 		map_destroy(conf->global);
 		conf->global = NULL;
+	}
+
+	if (single_mode && conf->global_xres) {
+		map_destroy(conf->global_xres);
+		conf->global_xres = NULL;
 	}
 
 	if (err > 0) {
@@ -299,6 +425,9 @@ int config_dir_load(const char *path, config_cb_t *cb, config_skip_cb_t *skip_cb
 
 	if (conf.global)
 		map_destroy(conf.global);
+
+	if (conf.global_xres)
+		map_destroy(conf.global_xres);
 
     return retval;
 }

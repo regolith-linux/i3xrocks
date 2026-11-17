@@ -18,10 +18,16 @@
 #ifndef XRES_H
 #define XRES_H
 
+#include <stdbool.h>
+
 /* Start the delay given to the X server to provide its resources */
 int xres_init(void);
 /* Return the non-empty value of an X resource, to be freed, or NULL */
 char *xres_get(const char *name);
+/* Return a descriptor to watch while the helper looks for a display, or -1 */
+int xres_watch(void);
+/* Read from the helper; true if the resources of a display were adopted */
+bool xres_update(void);
 void xres_free(void);
 
 #endif /* XRES_H */

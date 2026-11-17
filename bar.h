@@ -31,6 +31,11 @@ struct bar {
 
 	/* Base names of the configuration files with errors */
 	char *skipped;
+
+	unsigned long sleeptime;
+
+	/* Readable when a late display provides its X resources */
+	int xres_fd;
 };
 
 #define bar_printf(bar, lvl, fmt, ...) \

@@ -22,6 +22,7 @@
 
 #include "bar.h"
 #include "block.h"
+#include "config.h"
 #include "json.h"
 #include "line.h"
 #include "log.h"
@@ -89,25 +90,23 @@ static int block_child_env(struct block *block)
 	return block_for_each(block, block_setenv, NULL);
 }
 
-static int block_stdout(struct block *block)
+/* Lay the last output of the command over the configuration */
+static int block_compose(struct block *block)
 {
 	const char *label, *full_text;
-	int out = block->out[0];
 	char buf[BUFSIZ];
-	size_t count;
 	int err;
 
-	if (block->interval == INTERVAL_PERSIST)
-		count = 1;
-	else
-		count = -1; /* SIZE_MAX */
+	err = block_reset(block);
+	if (err)
+		return err;
 
-	if (block->format == FORMAT_JSON)
-		err = json_read(out, count, block->env);
-	else
-		err = i3bar_read(out, count, block->env);
+	/* Not updated yet */
+	if (!block->output)
+		return 0;
 
-	if (err && err != -EAGAIN)
+	err = map_copy(block->env, block->output);
+	if (err)
 		return err;
 
 	/* Deprecated label */
@@ -120,6 +119,43 @@ static int block_stdout(struct block *block)
 			return err;
 	}
 
+	/* Exit code takes precedence over the output */
+	if (block->code == EXIT_URGENT) {
+		err = block_set(block, "urgent", "true");
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int block_stdout(struct block *block)
+{
+	int out = block->out[0];
+	size_t count;
+	int err;
+
+	if (!block->output) {
+		block->output = map_create();
+		if (!block->output)
+			return -ENOMEM;
+	}
+
+	map_clear(block->output);
+
+	if (block->interval == INTERVAL_PERSIST)
+		count = 1;
+	else
+		count = -1; /* SIZE_MAX */
+
+	if (block->format == FORMAT_JSON)
+		err = json_read(out, count, block->output);
+	else
+		err = i3bar_read(out, count, block->output);
+
+	if (err && err != -EAGAIN)
+		return err;
+
 	return 0;
 }
 
@@ -127,21 +163,16 @@ int block_update(struct block *block)
 {
 	int err;
 
-	/* Reset properties to default before updating from output */
-	err = block_reset(block);
-	if (err)
-		return err;
-
 	err = block_stdout(block);
+
+	/* Properties back to their defaults, under what could be read */
+	if (!err)
+		err = block_compose(block);
+	else if (block->output && !block_reset(block))
+		map_copy(block->env, block->output);
+
 	if (err)
 		return err;
-
-	/* Exit code takes precedence over the output */
-	if (block->code == EXIT_URGENT) {
-		err = block_set(block, "urgent", "true");
-		if (err)
-			return err;
-	}
 
 	block_debug(block, "updated successfully");
 
@@ -482,6 +513,7 @@ static int i3blocks_setup(struct block *block)
 {
 	const char *value;
 
+	block->command = NULL;
 	value = map_get(block->config, "command");
 	if (value && *value != '\0')
 		block->command = value;
@@ -534,15 +566,98 @@ int block_setup(struct block *block)
 	return 0;
 }
 
+struct block_resolve {
+	struct block *block;
+	bool changed;
+};
+
+/* Resolve a property set from X resources again */
+static int block_resolve(const char *key, const char *lines, void *data)
+{
+	struct block_resolve *resolve = data;
+	struct block *block = resolve->block;
+	const char *prev;
+	char *value;
+	int err;
+
+	/* Replaced by a plain value */
+	if (!lines)
+		return 0;
+
+	err = config_xresource(lines, &value);
+	if (err || !value)
+		return err;
+
+	prev = map_get(block->config, key);
+	if (!prev || strcmp(prev, value) != 0) {
+		block_debug(block, "%s=%s from Xresources", key, value);
+		err = map_set(block->config, key, value);
+		resolve->changed = true;
+	}
+
+	free(value);
+
+	return err;
+}
+
+int block_adopt(struct block *block)
+{
+	struct block_resolve resolve = { .block = block };
+	int interval = block->interval;
+	int err;
+
+	if (!block->xres)
+		return 0;
+
+	err = map_for_each(block->xres, block_resolve, &resolve);
+	if (err || !resolve.changed)
+		return err;
+
+	/* The shortcuts point to the former values */
+	err = i3blocks_setup(block);
+	if (err)
+		return err;
+
+	/* A running command keeps the way it was spawned */
+	if (block_is_spawned(block) && interval != block->interval &&
+	    (interval == INTERVAL_PERSIST || block->interval == INTERVAL_PERSIST))
+		block->interval = interval;
+
+	/* A message stays until the next update or click */
+	if (!block->tainted) {
+		err = block_compose(block);
+		if (err)
+			return err;
+	}
+
+	/* Like the first forks, for a block which was not meant to run */
+	if (interval != block->interval && block->interval != 0 &&
+	    (interval == 0 || block->interval == INTERVAL_REPEAT ||
+	     block->interval == INTERVAL_PERSIST)) {
+		err = block_spawn(block);
+		if (err)
+			return err;
+
+		block_touch(block);
+	}
+
+	return 0;
+}
+
 void block_destroy(struct block *block)
 {
 	map_destroy(block->config);
 	map_destroy(block->env);
+	if (block->xres)
+		map_destroy(block->xres);
+	if (block->output)
+		map_destroy(block->output);
 	free(block->name);
 	free(block);
 }
 
-struct block *block_create(struct bar *bar, const struct map *config)
+struct block *block_create(struct bar *bar, const struct map *config,
+			   const struct map *xres)
 {
 	struct block *block;
 	int err;
@@ -571,6 +686,14 @@ struct block *block_create(struct bar *bar, const struct map *config)
 	if (!block->env) {
 		block_destroy(block);
 		return NULL;
+	}
+
+	if (xres) {
+		block->xres = map_create();
+		if (!block->xres || map_copy(block->xres, xres)) {
+			block_destroy(block);
+			return NULL;
+		}
 	}
 
 	return block;
