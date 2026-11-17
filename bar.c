@@ -31,6 +31,7 @@
 #include "sched.h"
 #include "sys.h"
 #include "term.h"
+#include "xres.h"
 
 static void bar_read(struct bar *bar)
 {
@@ -513,6 +514,10 @@ int bar_init(bool term, const char *path, const char *conf_dir, const char *user
 	struct bar *bar;
 	int err;
 
+	err = xres_init();
+	if (err)
+		return err;
+
 	bar = bar_create(term);
 	if (!bar)
 		return -ENOMEM;
@@ -522,6 +527,7 @@ int bar_init(bool term, const char *path, const char *conf_dir, const char *user
 	err = bar_poll(bar);
 
 	bar_destroy(bar);
+	xres_free();
 
 	return err;
 }

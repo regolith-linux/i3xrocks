@@ -20,7 +20,9 @@ i3xrocks_SOURCES = \
 	map.h \
 	sys.c \
 	sys.h \
-	term.h
+	term.h \
+	xres.c \
+	xres.h
 
 dist_man1_MANS = \
 	docs/i3xrocks.1
@@ -28,5 +30,5 @@ dist_man1_MANS = \
 dist_sysconf_DATA = \
 	i3xrocks.conf
 
-TESTS = tests/xresource-missing.sh tests/config-errors.sh
+TESTS = tests/xresource-missing.sh tests/config-errors.sh tests/no-display.sh
 EXTRA_DIST = $(TESTS)

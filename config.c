@@ -27,10 +27,13 @@
 #include "log.h"
 #include "map.h"
 #include "sys.h"
+#include "xres.h"
 
 #ifndef SYSCONFDIR
 #define SYSCONFDIR "/etc"
 #endif
+
+#define CONFIG_XRESOURCE "xresource:"
 
 struct config {
 	struct map *section;
@@ -101,8 +104,39 @@ static int config_ini_section_cb(char *section, void *data)
 	return config_set(data, "name", section);
 }
 
+/* Set a property from "<resource>[ <default>]", or leave it unset */
+static int config_set_xresource(struct config *conf, const char *key, char *spec)
+{
+	char *value, *def;
+	int err;
+
+	/* Split at the first space */
+	def = strchr(spec, ' ');
+	if (def)
+		*def++ = '\0';
+
+	value = xres_get(spec);
+	if (value) {
+		err = config_set(conf, key, value);
+		free(value);
+		return err;
+	}
+
+	if (def && *def != '\0')
+		return config_set(conf, key, def);
+
+	error("Xresource \"%s\" is not defined and has no default, ignoring %s",
+	      spec, key);
+
+	return 0;
+}
+
 static int config_ini_property_cb(char *key, char *value, void *data)
 {
+	/* The value of an X resource, with an optional default */
+	if (strncmp(value, CONFIG_XRESOURCE, strlen(CONFIG_XRESOURCE)) == 0)
+		return config_set_xresource(data, key, value + strlen(CONFIG_XRESOURCE));
+
 	return config_set(data, key, value);
 }
 

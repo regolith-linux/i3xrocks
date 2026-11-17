@@ -14,6 +14,16 @@ color=xresource:blockColor
 
 ---
 
+A default value may follow the resource name, separated by a space.  It is used when the resource is
+not defined or is empty, and when no X server provides its resources within a second of startup (for
+instance without `DISPLAY`, or with a server that does not answer).  Without a default, the property
+keeps the value it had (from the global properties) or stays unset:
+
+---
+color=xresource:blockColor #FFFFFF
+
+---
+
 3. Invalid lines and unreadable files in the configuration are skipped one by one, and the rest of the
 configuration is loaded.  The bar then shows an urgent first block naming the files with errors; run
 i3xrocks with `-v` or check its standard error for the details.
