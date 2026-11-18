@@ -31,6 +31,7 @@
 #include "sched.h"
 #include "sys.h"
 #include "term.h"
+#include "xres.h"
 
 static void bar_read(struct bar *bar)
 {
@@ -190,22 +191,13 @@ static int gcd(int a, int b)
 	return a;
 }
 
-static int bar_setup(struct bar *bar)
+/* The maximum sleep time is actually the GCD between all positive block intervals */
+static unsigned long bar_sleeptime(struct bar *bar)
 {
 	struct block *block = bar->blocks;
-	sigset_t *set = &bar->sigset;
 	unsigned long sleeptime = 0;
-	int sig;
-	int err;
 
 	while (block) {
-		err = block_setup(block);
-		if (err)
-			return err;
-
-		/* The maximum sleep time is actually the GCD
-		 * between all positive block intervals.
-		 */
 		if (block->interval > 0) {
 			if (sleeptime > 0)
 				sleeptime = gcd(sleeptime, block->interval);
@@ -215,6 +207,28 @@ static int bar_setup(struct bar *bar)
 
 		block = block->next;
 	}
+
+	return sleeptime;
+}
+
+static int bar_setup(struct bar *bar)
+{
+	struct block *block = bar->blocks;
+	sigset_t *set = &bar->sigset;
+	unsigned long sleeptime;
+	int sig;
+	int err;
+
+	while (block) {
+		err = block_setup(block);
+		if (err)
+			return err;
+
+		block = block->next;
+	}
+
+	sleeptime = bar_sleeptime(bar);
+	bar->sleeptime = sleeptime;
 
 	err = sys_sigemptyset(set);
 	if (err)
@@ -306,6 +320,13 @@ static void bar_teardown(struct bar *bar)
 		block = block->next;
 	}
 
+	/* Disable event I/O for the X resources of a late display */
+	if (bar->xres_fd >= 0) {
+		err = sys_async(bar->xres_fd, 0);
+		if (err)
+			error("failed to disable event I/O for Xresources");
+	}
+
 	/* Disable event I/O for stdin (clicks) */
 	err = sys_async(STDIN_FILENO, 0);
 	if (err)
@@ -326,6 +347,34 @@ static void bar_teardown(struct bar *bar)
 	debug("bar tear down");
 }
 
+/* Resolve the properties set from X resources again, with a late display */
+static void bar_adopt(struct bar *bar)
+{
+	struct block *block = bar->blocks;
+	unsigned long sleeptime;
+	int err;
+
+	if (!xres_update())
+		return;
+
+	while (block) {
+		err = block_adopt(block);
+		if (err)
+			block_error(block, "failed to apply Xresources");
+
+		block = block->next;
+	}
+
+	sleeptime = bar_sleeptime(bar);
+	if (sleeptime != bar->sleeptime) {
+		err = sys_setitimer(sleeptime);
+		if (!err)
+			bar->sleeptime = sleeptime;
+	}
+
+	bar_print(bar);
+}
+
 static int bar_poll(struct bar *bar)
 {
 	int sig, fd;
@@ -334,6 +383,17 @@ static int bar_poll(struct bar *bar)
 	err = bar_setup(bar);
 	if (err)
 		return err;
+
+	/* Keep looking for a display, if none was usable at startup */
+	bar->xres_fd = xres_watch();
+	if (bar->xres_fd >= 0) {
+		err = sys_async(bar->xres_fd, SIGRTMIN);
+		if (err)
+			return err;
+
+		/* Found while the configuration was loading */
+		bar_adopt(bar);
+	}
 
 	/* Initial display (for static blocks and loading labels) */
 	bar_print(bar);
@@ -366,6 +426,11 @@ static int bar_poll(struct bar *bar)
 
 		if (sig == SIGIO) {
 			bar_read(bar);
+			continue;
+		}
+
+		if (sig == SIGRTMIN && fd == bar->xres_fd) {
+			bar_adopt(bar);
 			continue;
 		}
 
@@ -406,6 +471,7 @@ static void bar_destroy(struct bar *bar)
 		block = next;
 	}
 
+	free(bar->skipped);
 	free(bar);
 }
 
@@ -418,13 +484,14 @@ static struct bar *bar_create(bool term)
 	if (!bar)
 		return NULL;
 
-	bar->blocks = block_create(bar, NULL);
+	bar->blocks = block_create(bar, NULL, NULL);
 	if (!bar->blocks) {
 		bar_destroy(bar);
 		return NULL;
 	}
 
 	bar->term = term;
+	bar->xres_fd = -1;
 
 	err = bar_start(bar);
 	if (err) {
@@ -435,7 +502,7 @@ static struct bar *bar_create(bool term)
 	return bar;
 }
 
-static int bar_config_cb(struct map *map, void *data)
+static int bar_config_cb(struct map *map, struct map *xres, void *data)
 {
 	struct bar *bar = data;
 	struct block *block = bar->blocks;
@@ -443,9 +510,11 @@ static int bar_config_cb(struct map *map, void *data)
 	while (block->next)
 		block = block->next;
 
-	block->next = block_create(bar, map);
+	block->next = block_create(bar, map, xres);
 
 	map_destroy(map);
+	if (xres)
+		map_destroy(xres);
 
 	if (!block->next)
 		return -ENOMEM;
@@ -453,34 +522,68 @@ static int bar_config_cb(struct map *map, void *data)
 	return 0;
 }
 
+/* Collect the base names of the files which were skipped or partially loaded */
+static int bar_skip_cb(const char *path, void *data)
+{
+	struct bar *bar = data;
+	const char *name = strrchr(path, '/');
+	size_t len = bar->skipped ? strlen(bar->skipped) : 0;
+	char *skipped;
+
+	name = name ? name + 1 : path;
+
+	skipped = realloc(bar->skipped, len + strlen(", ") + strlen(name) + 1);
+	if (!skipped)
+		return -ENOMEM;
+
+	sprintf(skipped + len, "%s%s", len ? ", " : "", name);
+	bar->skipped = skipped;
+
+	return 0;
+}
+
 static void bar_load(struct bar *bar, const char *path, const char *conf_dir, const char *user_conf_dir)
 {
-	int err;
+	struct block *status = bar->blocks;
+	int err = 0;
 
 	if (path) {
 		debug("Loading config from file %s", path);
-		err = config_load(path, bar_config_cb, bar);
+		err = config_load(path, bar_config_cb, bar_skip_cb, bar);
 	} else if (conf_dir || user_conf_dir) {
 		if (user_conf_dir) {
 			debug("Loading config from user directory %s", user_conf_dir);
-			err = config_dir_load(user_conf_dir, bar_config_cb, bar, true);
+			err = config_dir_load(user_conf_dir, bar_config_cb, bar_skip_cb, bar, true);
 		}
 
 		// If attempt at user conf failed and have system conf, or only have system conf:
 		if ((err && user_conf_dir && conf_dir) || (conf_dir && !user_conf_dir)) {
 			debug("Loading config from directory %s", conf_dir);
-			err = config_dir_load(conf_dir, bar_config_cb, bar, false);
+			err = config_dir_load(conf_dir, bar_config_cb, bar_skip_cb, bar, false);
 		}
 	}
 
 	if (err)
-		bar_fatal(bar, "Failed to load configuration.");
+		bar_fatal(bar, "Failed to load configuration");
+	else if (bar->skipped)
+		bar_fatal(bar, "Configuration errors in %s", bar->skipped);
+	else
+		return;
+
+	/* Keep the message for the whole run: the setup resets the blocks */
+	err = map_copy(status->config, status->env);
+	if (err)
+		error("failed to keep the configuration message");
 }
 
 int bar_init(bool term, const char *path, const char *conf_dir, const char *user_conf_dir)
 {
 	struct bar *bar;
 	int err;
+
+	err = xres_init();
+	if (err)
+		return err;
 
 	bar = bar_create(term);
 	if (!bar)
@@ -491,6 +594,7 @@ int bar_init(bool term, const char *path, const char *conf_dir, const char *user
 	err = bar_poll(bar);
 
 	bar_destroy(bar);
+	xres_free();
 
 	return err;
 }

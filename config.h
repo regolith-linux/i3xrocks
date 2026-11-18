@@ -21,8 +21,18 @@
 
 #include "map.h"
 
-typedef int config_cb_t(struct map *map, void *data);
-int config_load(const char *path, config_cb_t *cb, void *data);
-int config_dir_load(const char *path, config_cb_t *cb, void *data, const bool quiet);
+/*
+ * Called with the properties of each block and, for those set from X resources,
+ * what they are made of (or NULL); both maps are handed over
+ */
+typedef int config_cb_t(struct map *map, struct map *xres, void *data);
+/* Called with the path of each file that was skipped or partially loaded */
+typedef int config_skip_cb_t(const char *path, void *data);
+int config_load(const char *path, config_cb_t *cb, config_skip_cb_t *skip_cb,
+		void *data);
+int config_dir_load(const char *path, config_cb_t *cb, config_skip_cb_t *skip_cb,
+		    void *data, const bool quiet);
+/* Resolve a property set from X resources again; the value is to be freed */
+int config_xresource(const char *lines, char **value);
 
 #endif /* CONFIG_H */

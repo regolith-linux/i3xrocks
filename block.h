@@ -42,6 +42,12 @@ struct block {
 	struct map *config;
 	struct map *env;
 
+	/* What the properties set from X resources are made of */
+	struct map *xres;
+
+	/* Last output of the command, laid over the configuration */
+	struct map *output;
+
 	bool tainted;
 
 	/* Pretty name for log messages */
@@ -63,10 +69,12 @@ struct block {
 	struct block *next;
 };
 
-struct block *block_create(struct bar *bar, const struct map *config);
+struct block *block_create(struct bar *bar, const struct map *config,
+			   const struct map *xres);
 void block_destroy(struct block *block);
 
 int block_reset(struct block *block);
+int block_adopt(struct block *block);
 
 const char *block_get(const struct block *block, const char *key);
 int block_set(struct block *block, const char *key, const char *value);
